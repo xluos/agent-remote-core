@@ -23,6 +23,7 @@ import subprocess
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from .utils.session import (
     SOCKET_DIR, USER_DATA_DIR,
@@ -33,18 +34,24 @@ from .utils.session import (
 )
 
 
-def _setup_logging():
+def _setup_logging(foreground: bool = False):
+    """配置 logging。前台模式下 logger 不能写 stdout（会污染 PTY 透传）。"""
+    if foreground:
+        # 写到 stderr，stderr 在 cla -f 启动时会被 cla 包装重定向到日志文件
+        handler = logging.StreamHandler(sys.stderr)
+    else:
+        handler = logging.StreamHandler(sys.stdout)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s.%(msecs)03d [%(name)s] %(levelname)s %(message)s",
         datefmt="%Y-%m-%d %H:%M:%S",
-        handlers=[logging.StreamHandler(sys.stdout)],
+        handlers=[handler],
     )
 
 
 def _run_server_blocking(session_name: str, claude_args, cli_type: str,
                          debug_screen: bool, debug_verbose: bool,
-                         tmux_mirror_target=None):
+                         tmux_mirror_target=None, foreground: bool = False):
     """在当前进程内直接 run server（前台阻塞）"""
     from .server.server import ProxyServer
 
@@ -60,6 +67,7 @@ def _run_server_blocking(session_name: str, claude_args, cli_type: str,
         debug_screen=debug_screen,
         debug_verbose=debug_verbose,
         tmux_mirror_target=tmux_mirror_target,
+        foreground=foreground,
     )
 
     asyncio.run(server.start())
@@ -85,6 +93,57 @@ def _spawn_server_background(args_list, session_name: str) -> int:
             start_new_session=True,
         )
     return proc.pid
+
+
+def cmd_serve(args):
+    """前台模式：当前进程作为 PTY 宿主，stdout/stdin 透传
+
+    给 cla -f / claude-squad program 替换 / 任何在 tmux pane 里直接调用的
+    场景用。本进程结束 = 会话结束（跟 pane 同生共死）。
+    """
+    _setup_logging(foreground=True)
+    ensure_socket_dir()
+
+    # 名字策略：参数 > $TMUX 自动探测 > 错误
+    name = args.name
+    if not name:
+        tmux_session = _detect_tmux_session()
+        if tmux_session:
+            name = tmux_session
+        else:
+            print("错误: serve --foreground 必须指定 --name 或在 tmux 内运行（自动用 tmux session name）",
+                  file=sys.stderr)
+            return 1
+
+    # 保存环境快照
+    env_path = get_env_snapshot_path(name)
+    env_path.write_text(json.dumps(dict(os.environ)), encoding="utf-8")
+    os.chmod(env_path, 0o600)
+
+    _run_server_blocking(
+        session_name=name,
+        claude_args=args.cli_args or [],
+        cli_type=args.cli_type,
+        debug_screen=args.debug_screen,
+        debug_verbose=False,
+        foreground=True,
+    )
+    return 0
+
+
+def _detect_tmux_session() -> Optional[str]:
+    """探测当前是否在 tmux 内，若在则返回 session name"""
+    if not os.environ.get("TMUX"):
+        return None
+    try:
+        result = subprocess.run(
+            ["tmux", "display-message", "-p", "#{session_name}"],
+            capture_output=True, text=True, check=False,
+        )
+        name = result.stdout.strip()
+        return name or None
+    except Exception:
+        return None
 
 
 def cmd_start(args):
@@ -222,6 +281,19 @@ def main():
         description="Short-lived PTY-host runtime — start / serve --foreground / mirror / list / kill / paths",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
+
+    p_serve = sub.add_parser(
+        "serve",
+        help="前台模式：在当前进程跑 PTY + stdout/stdin 透传（给 cla -f / claude-squad program 用）",
+    )
+    p_serve.add_argument("--foreground", action="store_true", required=True,
+                         help="必须指定，标记前台模式")
+    p_serve.add_argument("--name",
+                         help="daemon session 名；不传时自动用当前 tmux session name")
+    p_serve.add_argument("--cli-type", default="claude", choices=["claude", "codex"])
+    p_serve.add_argument("--debug-screen", action="store_true")
+    p_serve.add_argument("cli_args", nargs="*", help="传给 CLI 的参数")
+    p_serve.set_defaults(func=cmd_serve)
 
     p_start = sub.add_parser("start", help="启动新会话（PTY 包 claude/codex）")
     p_start.add_argument("name")

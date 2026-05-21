@@ -799,7 +799,8 @@ class ProxyServer:
                  claude_cmd: str = "claude", codex_cmd: str = "codex",
                  cli_type: str = "claude",
                  debug_screen: bool = False, debug_verbose: bool = False,
-                 tmux_mirror_target: Optional[str] = None):
+                 tmux_mirror_target: Optional[str] = None,
+                 foreground: bool = False):
         self.session_name = session_name
         self.claude_args = claude_args or []
         self.claude_cmd = claude_cmd
@@ -809,6 +810,9 @@ class ProxyServer:
         self.debug_verbose = debug_verbose
         # Mirror 模式：观察一个已有的 tmux session，不 fork PTY
         self.tmux_mirror_target = tmux_mirror_target
+        # 前台模式：PTY 字节同时透传到本进程 stdout（让 tmux pane 显示 Claude UI）
+        # 启用时本进程是 tmux pane 里的唯一进程，stdin 也从本进程读
+        self.foreground = foreground
         self.socket_path = get_socket_path(session_name)
         self.pid_file = get_pid_file(session_name)
 
@@ -851,8 +855,15 @@ class ProxyServer:
         logger.info(f"正在启动 (session={self.session_name})")
         ensure_socket_dir()
 
-        # 清理旧的 socket 文件
+        # 检测同名 daemon 是否已在跑 —— 如果活就拒绝启动，避免抢 socket
         if self.socket_path.exists():
+            if self._existing_daemon_alive():
+                raise RuntimeError(
+                    f"会话 '{self.session_name}' 已存在且 daemon 仍在运行 "
+                    f"(socket={self.socket_path})。请用 attach 命令连接，"
+                    f"或先 kill 再 start。"
+                )
+            # 进程已死，残留 socket 文件，安全清理
             self.socket_path.unlink()
 
         # 启动数据源：PTY 或 tmux mirror
@@ -886,6 +897,11 @@ class ProxyServer:
             asyncio.create_task(self._read_tmux_pipe())
         else:
             asyncio.create_task(self._read_pty())
+
+        # 前台模式：额外起一个任务把自己 stdin 的字节写到 PTY master
+        # 这样 tmux pane 的输入（用户敲键、tmux send-keys）会进到 PTY 里
+        if self.foreground and not self.tmux_mirror_target:
+            asyncio.create_task(self._read_stdin_to_pty())
 
         # 切换到运行阶段日志
         self._switch_to_runtime_logging()
@@ -959,6 +975,17 @@ class ProxyServer:
         if self.cli_type == "codex":
             return self.codex_cmd
         return self.claude_cmd
+
+    def _existing_daemon_alive(self) -> bool:
+        """检查同名 daemon 是否仍在运行（用 pid 文件 + kill -0 探测）"""
+        if not self.pid_file.exists():
+            return False
+        try:
+            pid = int(self.pid_file.read_text().strip())
+            os.kill(pid, 0)  # 探测进程存在
+            return True
+        except (ValueError, ProcessLookupError, PermissionError):
+            return False
 
     def _start_pty(self):
         """启动 PTY 并运行 Claude"""
@@ -1149,6 +1176,12 @@ class ProxyServer:
                     self.history.append(coalesced)
                     # 广播给所有客户端
                     await self._broadcast_output(coalesced)
+                    # 前台模式：同时透传到本进程 stdout，让 tmux pane 显示 Claude UI
+                    if self.foreground:
+                        try:
+                            os.write(1, coalesced)
+                        except OSError:
+                            pass
                 elif data is None:
                     # 暂时无数据（BlockingIOError），稍等继续
                     await asyncio.sleep(0.01)
@@ -1179,6 +1212,37 @@ class ProxyServer:
         except BlockingIOError:
             return None
         # OSError（EIO）说明子进程已退出，PTY 已关闭，向上抛出让 _read_pty 检测并退出循环
+
+    async def _read_stdin_to_pty(self):
+        """前台模式：从本进程 stdin 读字节写到 PTY master
+
+        tmux pane 里跑 agent-remote-core serve --foreground 时，pane 的输入
+        （用户敲键、tmux send-keys -t）会变成本进程的 stdin。直接把这些字节
+        写到 PTY master，让 claude 看到。
+        """
+        loop = asyncio.get_event_loop()
+
+        def _read_once():
+            try:
+                return os.read(0, 4096)
+            except (BlockingIOError, OSError):
+                return None
+
+        while self.running and self.master_fd is not None:
+            try:
+                data = await loop.run_in_executor(None, _read_once)
+                if data is None:
+                    await asyncio.sleep(0.05)
+                    continue
+                if not data:
+                    # stdin 关闭了，但 PTY 可能还活
+                    await asyncio.sleep(0.1)
+                    continue
+                os.write(self.master_fd, data)
+            except Exception as e:
+                if self.running:
+                    logger.error(f"stdin → PTY 转发错误: {e}")
+                break
 
     async def _handle_client(self, reader: asyncio.StreamReader,
                               writer: asyncio.StreamWriter):
