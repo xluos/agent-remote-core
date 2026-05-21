@@ -1,7 +1,13 @@
-"""agent-remote-daemon CLI
+"""agent-remote-core CLI
+
+A short-lived PTY-host runtime. Spawned per-session by upper-layer apps
+(agent-remote, agentara, third-party TS apps via @agent-remote/sdk).
+Each invocation hosts one CLI inside a PTY, parses ANSI into a
+ClaudeWindow snapshot, exposes input over a Unix socket.
 
 Subcommands:
-  start   起一个新会话（fork PTY 包 claude/codex）
+  start   起一个新会话（fork PTY 包 claude/codex），后台 daemon 模式
+  serve   serve --foreground：在当前 pane 跑 PTY 并 stdout 透传（前台模式）
   mirror  镜像一个已存在的 tmux session（不 fork PTY，旁观字节流）
   list    列出活跃会话
   kill    停止一个会话
@@ -212,8 +218,8 @@ def cmd_paths(args):
 
 def main():
     parser = argparse.ArgumentParser(
-        prog="agent-remote-daemon",
-        description="PTY-based agent session daemon with tmux mirror support",
+        prog="agent-remote-core",
+        description="Short-lived PTY-host runtime — start / serve --foreground / mirror / list / kill / paths",
     )
     sub = parser.add_subparsers(dest="cmd", required=True)
 
